@@ -43,7 +43,7 @@ div[data-testid="metric-container"]{
 }
 div[data-testid="metric-container"] * { color: #e5e7eb !important; }
 
-/* Buttons (single source of truth) */
+/* Buttons */
 .stButton>button {
   background: #0ea5e9 !important;
   color: white !important;
@@ -83,7 +83,6 @@ def get_prices(tickers, start, end):
     if df is None or df.empty:
         raise RuntimeError("yfinance returned empty data (API limit / internet / ticker issue).")
 
-    # MultiIndex columns case (common when downloading multiple tickers)
     if isinstance(df.columns, pd.MultiIndex):
         level0 = df.columns.get_level_values(0)
         if "Adj Close" in level0:
@@ -93,7 +92,6 @@ def get_prices(tickers, start, end):
         else:
             raise KeyError(f"No 'Adj Close' or 'Close'. Columns: {df.columns}")
     else:
-        # Single ticker case
         if "Adj Close" in df.columns:
             out = df["Adj Close"].copy()
         elif "Close" in df.columns:
@@ -123,7 +121,6 @@ def compute_weights_from_preds(preds: pd.Series, symbols, min_weight=0.01, max_w
     if preds.empty:
         return pd.Series(dtype=float)
 
-    # softmax on standardized preds
     x = preds.values
     x = (x - x.mean()) / (x.std() + 1e-8)
     expx = np.exp(np.clip(x, -5, 5))
@@ -131,11 +128,9 @@ def compute_weights_from_preds(preds: pd.Series, symbols, min_weight=0.01, max_w
 
     weights = pd.Series(w, index=preds.index).reindex(symbols).fillna(0.0)
 
-    # floor
     weights = weights + min_weight
     weights = weights / weights.sum()
 
-    # cap + redistribute
     for _ in range(10):
         over = weights > max_weight
         if not over.any():
@@ -145,13 +140,76 @@ def compute_weights_from_preds(preds: pd.Series, symbols, min_weight=0.01, max_w
         under = ~over
         if under.sum() == 0:
             break
-        weights[under] = weights[under] + excess * (weights[under] / weights[under].sum())
+        weights[under] = weights[under] + excess * (weights[under] / (weights[under].sum() + 1e-12))
 
     return weights / weights.sum()
 
 
 # -----------------------------
-# Header (Professional hero)
+# CACHED MODEL TRAINING (big speed-up)
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def train_models_cached(log_returns_train: pd.DataFrame, symbols: tuple, lookback_period: int, epochs: int, fast_mode: bool):
+    """
+    Cache trained models so repeated runs don't retrain.
+    Using tuple(symbols) makes cache keys stable/hashiable.
+    """
+    models, scalers = {}, {}
+
+    # Smaller model in fast mode
+    if fast_mode:
+        lstm1, lstm2, batch = 24, 12, 128
+    else:
+        lstm1, lstm2, batch = 32, 16, 64
+
+    for sym in symbols:
+        if sym not in log_returns_train.columns:
+            continue
+
+        r = log_returns_train[sym].dropna().values.reshape(-1, 1)
+        if len(r) < lookback_period + 80:
+            continue
+
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        r_scaled = scaler.fit_transform(r).flatten()
+        X, y = make_supervised(r_scaled, lookback_period)
+
+        model = Sequential(
+            [
+                LSTM(lstm1, return_sequences=True, input_shape=(lookback_period, 1)),
+                Dropout(0.15),
+                LSTM(lstm2),
+                Dropout(0.10),
+                Dense(1),
+            ]
+        )
+        model.compile(optimizer="adam", loss="mean_squared_error")
+        model.fit(X, y, epochs=epochs, batch_size=batch, verbose=0)
+
+        models[sym] = model
+        scalers[sym] = scaler
+
+    return models, scalers
+
+
+def predict_next_log_return(sym, asof_date, log_returns_all, models, scalers, lookback_period):
+    if sym not in models:
+        return np.nan
+    hist = log_returns_all.loc[:asof_date, sym].dropna()
+    if len(hist) < lookback_period:
+        return np.nan
+
+    last_window = hist.values[-lookback_period:].reshape(-1, 1)
+    scaled = scalers[sym].transform(last_window).flatten()
+    X = scaled.reshape((1, lookback_period, 1))
+
+    pred_scaled = models[sym].predict(X, verbose=0)[0, 0]
+    pred = scalers[sym].inverse_transform(np.array(pred_scaled).reshape(1, 1))[0, 0]
+    return float(pred)
+
+
+# -----------------------------
+# Header
 # -----------------------------
 st.markdown(
     """
@@ -198,8 +256,10 @@ with st.sidebar:
     trade_start = st.date_input("Trade start", value=pd.to_datetime("2017-01-01"))
 
     st.markdown("### Model")
-    lookback_period = st.slider("Lookback (days)", 60, 400, 252, step=5)
-    epochs = st.slider("LSTM epochs", 3, 30, 10, step=1)
+    fast_mode = st.toggle("Fast mode (recommended)", value=True, help="Trains faster using a smaller model and shorter training window.")
+
+    lookback_period = st.slider("Lookback (days)", 60, 300 if fast_mode else 400, 180 if fast_mode else 252, step=5)
+    epochs = st.slider("LSTM epochs", 1, 12 if fast_mode else 30, 4 if fast_mode else 10, step=1)
 
     st.markdown("### Portfolio Constraints")
     min_weight = st.slider("Min weight", 0.0, 0.10, 0.01, step=0.005)
@@ -207,6 +267,12 @@ with st.sidebar:
 
     st.markdown("### Risk-free rate")
     annual_rf = st.number_input("Risk-free rate (annual)", min_value=0.0, max_value=0.20, value=0.03, step=0.005)
+
+    st.markdown("### Training window")
+    if fast_mode:
+        train_days = st.slider("Days used for training", 300, 900, 700, step=50)
+    else:
+        train_days = st.slider("Days used for training", 600, 2000, 1400, step=100)
 
     run = st.button("Run backtest", use_container_width=True)
 
@@ -226,54 +292,31 @@ with st.spinner("Downloading data..."):
     prices = prices.dropna(how="all").ffill().dropna()
 
 log_returns = np.log(prices / prices.shift(1)).dropna()
+
 bt_dates = log_returns.index[log_returns.index >= pd.Timestamp(trade_start)]
 if bt_dates.empty:
     st.error("No backtest dates found. Try an earlier trade start or wider date range.")
     st.stop()
 
-# monthly rebalance (first trading day each month)
 rebalance_dates = bt_dates.to_series().groupby(pd.Grouper(freq="MS")).head(1)
 rebalance_dates = pd.to_datetime(rebalance_dates.values)
 
-# Train models
-models, scalers = {}, {}
-with st.spinner("Training LSTMs (one per asset)..."):
-    for sym in symbols:
-        r = log_returns[sym].dropna().values.reshape(-1, 1)
-        if len(r) < lookback_period + 20:
-            continue
+# Training data: rolling recent window (speed + avoids overfitting to old regimes)
+log_returns_train = log_returns.tail(int(train_days)).copy()
 
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        r_scaled = scaler.fit_transform(r).flatten()
-        X, y = make_supervised(r_scaled, lookback_period)
+# Train models (CACHED)
+with st.spinner("Training LSTMs (cached)..."):
+    models, scalers = train_models_cached(
+        log_returns_train,
+        tuple(symbols),
+        lookback_period,
+        epochs,
+        fast_mode,
+    )
 
-        model = Sequential(
-            [
-                LSTM(64, return_sequences=True, input_shape=(lookback_period, 1)),
-                Dropout(0.2),
-                LSTM(32),
-                Dropout(0.2),
-                Dense(1),
-            ]
-        )
-        model.compile(optimizer="adam", loss="mean_squared_error")
-        model.fit(X, y, epochs=epochs, batch_size=32, verbose=0)
-
-        models[sym] = model
-        scalers[sym] = scaler
-
-def predict_next_log_return(sym, asof_date):
-    if sym not in models:
-        return np.nan
-    hist = log_returns.loc[:asof_date, sym].dropna()
-    if len(hist) < lookback_period:
-        return np.nan
-    last_window = hist.values[-lookback_period:].reshape(-1, 1)
-    scaled = scalers[sym].transform(last_window).flatten()
-    X = scaled.reshape((1, lookback_period, 1))
-    pred_scaled = models[sym].predict(X, verbose=0)[0, 0]
-    pred = scalers[sym].inverse_transform(np.array(pred_scaled).reshape(1, 1))[0, 0]
-    return float(pred)
+if len(models) < 2:
+    st.error("Not enough models trained (try fewer tickers, smaller lookback, or longer training window).")
+    st.stop()
 
 # Initialize portfolio
 initial_investment = 100000.0
@@ -283,12 +326,14 @@ portfolio_value.iloc[0] = initial_investment
 
 current_weights = pd.Series(1 / len(symbols), index=symbols)
 
+# Run backtest
 for i, date in enumerate(bt_dates):
     if date in rebalance_dates:
         asof = bt_dates[i - 1] if i > 0 else date
-        preds = pd.Series({s: predict_next_log_return(s, asof) for s in symbols})
+        preds = pd.Series(
+            {s: predict_next_log_return(s, asof, log_returns, models, scalers, lookback_period) for s in symbols}
+        )
         new_w = compute_weights_from_preds(preds, symbols, min_weight=min_weight, max_weight=max_weight)
-
         if (not new_w.empty) and np.isfinite(new_w.values).all():
             current_weights = new_w
 
@@ -364,6 +409,13 @@ with tab2:
 
 with tab3:
     st.subheader("QuantStats Report")
-    st.caption("This renders a full performance report inside the app.")
-    qs.reports.full(portfolio_returns, benchmark=spy_returns, rf=annual_rf, compounded=True)
+    st.caption("Full performance report (can be heavy to render).")
 
+    # Optional: let user choose to render full report (avoids slow UI by default)
+    render_report = st.toggle("Render full QuantStats report", value=False)
+    if render_report:
+        qs.reports.full(portfolio_returns, benchmark=spy_returns, rf=annual_rf, compounded=True)
+    else:
+        st.info("Toggle on to render the full report. (This can take a bit.)")
+
+st.caption("Tip: In **Fast mode**, repeated runs with the same settings reuse cached models and should be much faster.")
