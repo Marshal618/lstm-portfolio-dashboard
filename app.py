@@ -92,6 +92,17 @@ def compute_weights_from_preds(preds: pd.Series, symbols, min_weight=0.01, max_w
 # UI
 # -----------------------------
 st.title("LSTM Portfolio Lab (Free Quant Dashboard)")
+st.markdown("""
+### Strategy Overview
+
+This strategy uses an LSTM neural network to forecast next-day log returns for selected equities.
+Predicted returns are converted into portfolio weights using a softmax allocation with minimum
+and maximum constraints. The portfolio rebalances monthly and evaluates performance using
+risk-adjusted metrics.
+
+This dashboard demonstrates ML-based signal generation, constrained portfolio optimization,
+and systematic backtesting.
+""")
 
 with st.sidebar:
     st.header("Strategy Settings")
