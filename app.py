@@ -8,6 +8,8 @@ import streamlit as st
 import plotly.graph_objs as go
 import streamlit.components.v1 as components
 import quantstats as qs
+import joblib  
+
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -20,7 +22,7 @@ from src.risk import (
 )
 
 # Supabase model packs (pretrained)
-# Create src/model_registry.py from the earlier snippet I gave you, and add to requirements.txt:
+# Make sure requirements.txt includes:
 # supabase, joblib, python-dotenv
 from src.model_registry import (
     PackMeta,
@@ -131,7 +133,7 @@ def get_prices(tickers, start, end):
 
 
 # -----------------------------
-# CACHED MODEL TRAINING (big speed-up)
+# CACHED MODEL TRAINING (big speed-up within the same Streamlit runtime)
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def train_models_cached(
@@ -141,10 +143,6 @@ def train_models_cached(
     epochs: int,
     fast_mode: bool,
 ):
-    """
-    Cache trained models so repeated runs don't retrain (within the same Streamlit runtime).
-    For cross-restart persistence + sharing, use Supabase model packs (below).
-    """
     models, scalers = {}, {}
 
     # Smaller model in fast mode
@@ -183,6 +181,23 @@ def train_models_cached(
     return models, scalers
 
 
+def save_model_pack(models: dict, scalers: dict, pack_dir: str):
+    """Local save helper (optional). Supabase pack is the real persistence."""
+    os.makedirs(pack_dir, exist_ok=True)
+
+    for sym, model in models.items():
+        model_path = os.path.join(pack_dir, f"{sym}.keras")
+        model.save(model_path)
+
+    scaler_path = os.path.join(pack_dir, "scalers.joblib")
+    joblib.dump(scalers, scaler_path)
+
+    meta_path = os.path.join(pack_dir, "meta.txt")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write("Model pack for LSTM Portfolio Lab\n")
+        f.write(f"Symbols: {list(models.keys())}\n")
+
+
 # -----------------------------
 # Header
 # -----------------------------
@@ -210,15 +225,11 @@ Build a signal, turn it into a portfolio, then stress-test the risk.
 with st.expander("How this dashboard works", expanded=True):
     st.markdown(
         """
-**1) LSTM signal (forecast):** The LSTM looks at a recent window of returns for each stock and outputs a *next-step return guess*.
-It’s not “magic”; it’s just a flexible pattern detector.
-
-**2) Portfolio weights (rules):** We turn those forecasts into weights with simple constraints
-(minimum position size + max concentration).
-
-**3) Backtest (history):** We rebalance monthly and see how the strategy would have behaved.
-
-**4) Monte Carlo (what-if):** We simulate many possible future paths so you can see the range of outcomes, not just one curve.
+**LSTM (signal):** Looks at recent returns and outputs a *next-step signal* for each stock.  
+**Portfolio (rules):** Turns those signals into weights with min/max limits.  
+**Backtest (history):** Rebalances monthly and shows what would have happened.  
+**Monte Carlo (what-if):** Simulates many possible future paths so you see a range of outcomes.  
+**Signals tab:** Lets you inspect what the model output was, and whether it lined up with what happened next.
         """
     )
 
@@ -229,7 +240,6 @@ with st.sidebar:
     st.markdown("## Controls")
     st.caption("Pick tickers, choose a model mode, then run the backtest.")
 
-    # ---- Supabase model packs
     st.markdown("### Pretrained models (Supabase)")
     model_mode = st.radio("Mode", ["Use pretrained (fast)", "Train & upload (slow)"], index=0)
     force_retrain = st.toggle("Force retrain", value=False, help="Ignore pretrained packs/caches and retrain now.")
@@ -248,7 +258,6 @@ with st.sidebar:
 
     st.divider()
 
-    # ---- Monte Carlo controls (in sidebar)
     st.markdown("### Monte Carlo")
     mc_enabled = st.toggle("Enable Monte Carlo", value=True)
     mc_method = st.selectbox("Method", ["Bootstrap (recommended)", "Parametric (Normal)"])
@@ -258,21 +267,16 @@ with st.sidebar:
 
     st.divider()
 
-    # ---- Universe
     st.markdown("### Universe")
     symbols_default = ["TSM", "GOOGL", "EQIX", "ASML", "ALGN", "KO", "DIS", "XOM", "AWK", "BHP", "V"]
     symbols = st.multiselect("Tickers", options=symbols_default, default=symbols_default)
 
     start_date = st.date_input("Start date", value=pd.to_datetime("2016-01-01"))
-    end_date = st.date_input("End date", value=pd.to_datetime("2022-12-31"))
+    end_date = st.date_input("End date", value=pd.Timestamp.today().normalize().date())  
     trade_start = st.date_input("Trade start", value=pd.to_datetime("2017-01-01"))
 
     st.markdown("### LSTM training")
-    fast_mode = st.toggle(
-        "Fast mode",
-        value=True,
-        help="Smaller network + shorter training window.",
-    )
+    fast_mode = st.toggle("Fast mode", value=True, help="Smaller network + shorter training window.")
     lookback_period = st.slider("Lookback (days)", 60, 300 if fast_mode else 400, 180 if fast_mode else 252, step=5)
     epochs = st.slider("Epochs", 1, 12 if fast_mode else 30, 4 if fast_mode else 10, step=1)
 
@@ -300,7 +304,7 @@ if len(symbols) < 2:
     st.stop()
 
 # -----------------------------
-# Backtest
+# Backtest Data
 # -----------------------------
 with st.spinner("Downloading data..."):
     prices = get_prices(symbols, str(start_date), str(end_date))
@@ -316,7 +320,7 @@ if bt_dates.empty:
 rebalance_dates = bt_dates.to_series().groupby(pd.Grouper(freq="MS")).head(1)
 rebalance_dates = pd.to_datetime(rebalance_dates.values)
 
-# Training data: rolling recent window (speed + avoids overfitting to old regimes)
+# Training data: rolling recent window
 log_returns_train = log_returns.tail(int(train_days)).copy()
 
 # -----------------------------
@@ -325,17 +329,22 @@ log_returns_train = log_returns.tail(int(train_days)).copy()
 pack_id = make_pack_id(symbols, lookback_period, epochs, int(train_days), fast_mode)
 
 models, scalers = None, None
+loaded_from_supabase = False
+trained_now = False
 
+# 1) Try loading pack if user chose it and not forcing retrain
 if (not force_retrain) and model_mode.startswith("Use") and selected_pack:
     try:
         with st.spinner(f"Loading pretrained pack: {selected_pack}..."):
             zip_bytes = download_pack(selected_pack)
             meta, models, scalers = load_models_from_zip(zip_bytes)
+        loaded_from_supabase = True
         st.success(f"Loaded pretrained pack: {selected_pack}")
     except Exception as e:
         st.warning(f"Could not load pretrained pack. Falling back to training. ({e})")
         models, scalers = None, None
 
+# 2) Train ONLY if we still need models
 if models is None or scalers is None:
     with st.spinner("Training LSTMs (cached)..."):
         models, scalers = train_models_cached(
@@ -345,43 +354,69 @@ if models is None or scalers is None:
             epochs,
             fast_mode,
         )
+    trained_now = True
 
-    if model_mode.startswith("Train"):
-        try:
-            with st.spinner(f"Uploading model pack to Supabase: {pack_id}..."):
-                meta = PackMeta(
-                    pack_id=pack_id,
-                    symbols=tuple(symbols),
-                    lookback=lookback_period,
-                    epochs=epochs,
-                    train_days=int(train_days),
-                    fast_mode=bool(fast_mode),
-                )
-                zip_bytes = build_zip_from_models(meta, models, scalers)
-                upload_pack(pack_id, zip_bytes)
-            st.success(f"Uploaded model pack: {pack_id}")
-        except Exception as e:
-            st.warning(f"Trained models, but upload failed: {e}")
-
-if len(models) < 2:
+# 3) Safety check
+if not isinstance(models, dict) or len(models) < 2:
     st.error("Not enough models trained/loaded (try fewer tickers, smaller lookback, or longer training window).")
     st.stop()
 
-# Initialize portfolio
+# 4) Upload ONLY in Train & upload mode
+if model_mode.startswith("Train"):
+    try:
+        with st.spinner(f"Uploading model pack to Supabase: {pack_id}..."):
+            meta = PackMeta(
+                pack_id=pack_id,
+                symbols=tuple(symbols),
+                lookback=int(lookback_period),
+                epochs=int(epochs),
+                train_days=int(train_days),
+                fast_mode=bool(fast_mode),
+            )
+            zip_bytes = build_zip_from_models(meta, models, scalers)
+            upload_pack(pack_id, zip_bytes)
+        st.success(f"Uploaded model pack: {pack_id}")
+    except Exception as e:
+        st.warning(f"Models are ready, but upload failed: {e}")
+else:
+    # optional local save only when training occurred and we didn't load from Supabase
+    if trained_now and (not loaded_from_supabase):
+        pack_dir = "model_pack"
+        if not os.path.exists(pack_dir):
+            save_model_pack(models, scalers, pack_dir)
+            st.info("Saved a local ./model_pack snapshot (optional). Supabase packs are the main persistence.")
+
+# -----------------------------
+# Backtest Engine + Signal Diagnostics
+# -----------------------------
 initial_investment = 100000.0
 weights_history = pd.DataFrame(index=bt_dates, columns=symbols, dtype=float)
 portfolio_value = pd.Series(index=bt_dates, dtype=float)
 portfolio_value.iloc[0] = initial_investment
 
+# Store monthly signal snapshots + realized next-day return for evaluation
+preds_history = pd.DataFrame(index=rebalance_dates, columns=symbols, dtype=float)
+realized_history = pd.DataFrame(index=rebalance_dates, columns=symbols, dtype=float)
+
 current_weights = pd.Series(1 / len(symbols), index=symbols)
 
-# Run backtest
 for i, date in enumerate(bt_dates):
     if date in rebalance_dates:
         asof = bt_dates[i - 1] if i > 0 else date
+
         preds = pd.Series(
             {s: predict_next_log_return(s, asof, log_returns, models, scalers, lookback_period) for s in symbols}
         )
+
+        # record model outputs at rebalance date
+        preds_history.loc[date, preds.index] = preds.values
+
+        # record realized next-day return (for signal quality metrics)
+        if i < len(bt_dates) - 1:
+            next_day = bt_dates[i + 1]
+            realized_next = log_returns.loc[next_day, symbols].astype(float)
+            realized_history.loc[date, realized_next.index] = realized_next.values
+
         new_w = compute_weights_from_preds(preds, symbols, min_weight=min_weight, max_weight=max_weight)
         if (not new_w.empty) and np.isfinite(new_w.values).all():
             current_weights = new_w
@@ -424,6 +459,17 @@ k3.metric("Sharpe", f"{sh:.2f}")
 k4.metric("Max Drawdown", f"{mdd:.2%}")
 
 # -----------------------------
+# Signal quality metrics (IC + hit-rate)
+# -----------------------------
+pairs = (
+    preds_history.stack().rename("pred").to_frame()
+    .join(realized_history.stack().rename("realized"), how="inner")
+    .dropna()
+)
+ic = float(pairs["pred"].corr(pairs["realized"])) if len(pairs) > 2 else np.nan
+hit_rate = float((np.sign(pairs["pred"]) == np.sign(pairs["realized"])).mean()) if len(pairs) > 0 else np.nan
+
+# -----------------------------
 # QuantStats report as cached HTML (always-on)
 # -----------------------------
 @st.cache_data(show_spinner=False)
@@ -435,9 +481,11 @@ def quantstats_html(returns: pd.Series, benchmark: pd.Series, rf: float) -> str:
             return f.read()
 
 # -----------------------------
-# Charts + Report (Tabs)
+# Tabs
 # -----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Performance", "Portfolio Weights", "Report", "Risk (Monte Carlo)"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Performance", "Portfolio Weights", "Report", "Risk (Monte Carlo)", "Signals (Model Output)"]
+)
 
 with tab1:
     st.subheader("Equity Curve")
@@ -469,7 +517,7 @@ with tab2:
 
 with tab3:
     st.subheader("QuantStats Report")
-    st.caption("Auto-generated report for deeper diagnostics (cached to keep the app responsive).")
+    st.caption("Auto-generated diagnostics (cached to keep the app responsive).")
     html = quantstats_html(portfolio_returns, spy_returns, annual_rf)
     components.html(html, height=900, scrolling=True)
 
@@ -484,17 +532,13 @@ with tab4:
     st.markdown(
         """
 **How to read this:**
-- The backtest is *one* path that happened in the past.
-- Monte Carlo generates *many* possible future paths so you can see a range: good outcomes, bad outcomes, and everything in between.
-- Focus on the **loss probability** and the **bad-percentile outcomes** (like the 5th percentile) if you care about downside.
+- The backtest shows one historical path.
+- Monte Carlo generates many plausible future paths so you can see a range: good outcomes, bad outcomes, and everything in between.
+- If you care about downside, focus on **probability of loss** and the **5th percentile** outcome.
         """
     )
 
     mc_days = int(252 * mc_years)
-
-    if portfolio_returns.empty:
-        st.warning("No returns available for Monte Carlo.")
-        st.stop()
 
     try:
         if mc_method.startswith("Bootstrap"):
@@ -516,7 +560,6 @@ with tab4:
         c3.metric("Prob. of loss", f"{stats['prob_loss']:.1%}")
         st.caption(method_note)
 
-        # Plot: subset of paths for responsiveness
         n_plot = min(200, eq_paths.shape[0])
         plot_idx = np.linspace(0, eq_paths.shape[0] - 1, n_plot).astype(int)
         eq_plot = eq_paths[plot_idx]
@@ -543,9 +586,67 @@ with tab4:
     except Exception as e:
         st.error(f"Monte Carlo failed: {e}")
 
+with tab5:
+    st.subheader("Signals (Model Output)")
+    st.caption("These are model outputs used by the strategy to rebalance. They’re useful for transparency and diagnostics.")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Information Coefficient (IC)", "—" if np.isnan(ic) else f"{ic:.3f}")
+    c2.metric("Directional hit-rate", "—" if np.isnan(hit_rate) else f"{hit_rate:.1%}")
+    c3.metric("Signal samples", f"{len(pairs):,}")
+
+    st.markdown(
+        """
+**How to use this tab:**
+- Think of the LSTM output as a *signal score* for “next-step return”.
+- A higher score doesn’t guarantee profit — it just means the model is more optimistic **relative to the other stocks**.
+- IC and hit-rate are quick checks: did the signal line up with what happened next?
+        """
+    )
+
+    last_dt = preds_history.dropna(how="all").index.max()
+    if pd.isna(last_dt):
+        st.info("No signal snapshots were recorded.")
+    else:
+        pred_row = preds_history.loc[last_dt].dropna()
+        real_row = realized_history.loc[last_dt].dropna()
+
+        df_sig = pd.DataFrame(
+            {
+                "pred_log_return": pred_row,
+                "realized_next_log_return": real_row.reindex(pred_row.index),
+            }
+        )
+        df_sig["pred_rank"] = df_sig["pred_log_return"].rank(ascending=False, method="average")
+        df_sig["direction_match"] = np.sign(df_sig["pred_log_return"]) == np.sign(df_sig["realized_next_log_return"])
+        df_sig = df_sig.sort_values("pred_rank")
+
+        st.write(f"Most recent rebalance snapshot: **{last_dt.date()}**")
+        st.dataframe(df_sig, use_container_width=True)
+
+        pts = df_sig.dropna(subset=["pred_log_return", "realized_next_log_return"])
+        if len(pts) > 2:
+            fig_sc = go.Figure()
+            fig_sc.add_trace(
+                go.Scatter(
+                    x=pts["pred_log_return"],
+                    y=pts["realized_next_log_return"],
+                    mode="markers",
+                    text=pts.index,
+                    name="Points",
+                )
+            )
+            fig_sc.update_layout(
+                height=420,
+                xaxis_title="Predicted next-day log return (signal)",
+                yaxis_title="Realized next-day log return",
+            )
+            st.plotly_chart(fig_sc, use_container_width=True)
+
 st.caption(
-    "Tip: If you select **Use pretrained**, the app loads saved models instantly. "
-    "Use **Train & upload** only when you want to create a new model pack."
+    "Tip: **Use pretrained** loads saved models instantly. "
+    "**Train & upload** is for creating a new Supabase pack when you change settings."
 )
+
 
 
