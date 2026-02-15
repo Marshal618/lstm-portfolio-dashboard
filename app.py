@@ -8,6 +8,11 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from src.core import make_supervised, compute_weights_from_preds, predict_next_log_return
+from src.risk import (
+    simulate_paths_parametric,
+    simulate_paths_bootstrap,
+    summarize_terminal,
+)
 
 qs.extend_pandas()
 np.random.seed(42)
@@ -325,7 +330,8 @@ k4.metric("Max Drawdown", f"{mdd:.2%}")
 # -----------------------------
 # Charts + Report (Tabs)
 # -----------------------------
-tab1, tab2, tab3 = st.tabs(["Performance", "Portfolio Weights", "Report"])
+tab1, tab2, tab3, tab4 = st.tabs(["Performance", "Portfolio Weights", "Report", "Risk (Monte Carlo)"])
+
 
 with tab1:
     st.subheader("Equity Curve")
@@ -367,3 +373,107 @@ with tab3:
         st.info("Toggle on to render the full report. (This can take a bit.)")
 
 st.caption("Tip: In **Fast mode**, repeated runs with the same settings reuse cached models and should be much faster.")
+
+with tab4:
+    st.subheader("Monte Carlo Risk Simulation")
+    st.caption("Simulate many plausible future equity paths using either parametric (Normal) returns or bootstrap resampling.")
+
+    st.markdown(
+        """
+**What this is (quant explanation):**
+- **Backtest** answers: *“What happened historically under my rules?”*
+- **Monte Carlo** answers: *“Given the return characteristics I observed, what range of outcomes could happen?”*
+
+**How to interpret:**
+- The fan of lines = many possible future portfolio paths.
+- The terminal distribution tells you downside risk (loss probability, bad-percentile outcomes) and upside potential.
+        """
+    )
+
+    mc_col1, mc_col2, mc_col3 = st.columns([1.2, 1.0, 1.0])
+
+    with mc_col1:
+        mc_method = st.selectbox("Simulation method", ["Bootstrap (recommended)", "Parametric (Normal)"])
+        mc_years = st.slider("Horizon (years)", 1, 5, 1)
+        mc_days = int(252 * mc_years)
+        mc_sims = st.slider("Number of simulations", 200, 10000, 2000, step=200)
+        mc_seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=42, step=1)
+
+    # Use your already-computed daily portfolio returns
+    # portfolio_returns exists earlier in your script
+    if portfolio_returns.empty:
+        st.warning("No returns available for Monte Carlo.")
+        st.stop()
+
+    try:
+        if mc_method.startswith("Bootstrap"):
+            eq_paths, meta = simulate_paths_bootstrap(portfolio_returns, n_sims=mc_sims, n_days=mc_days, seed=int(mc_seed))
+            method_note = "Bootstrap resamples realized daily returns (keeps fat tails better)."
+        else:
+            eq_paths, meta = simulate_paths_parametric(portfolio_returns, n_sims=mc_sims, n_days=mc_days, seed=int(mc_seed))
+            method_note = "Parametric assumes i.i.d. Normal returns (often underestimates tail risk)."
+
+        stats, terminal = summarize_terminal(eq_paths)
+
+        with mc_col2:
+            st.markdown("### Terminal outcomes (× initial capital)")
+            st.write(f"Method: {mc_method}")
+            st.caption(method_note)
+            st.metric("Median (P50)", f"{stats['p50']:.2f}×")
+            st.metric("5th percentile (P05)", f"{stats['p05']:.2f}×")
+            st.metric("95th percentile (P95)", f"{stats['p95']:.2f}×")
+
+        with mc_col3:
+            st.markdown("### Downside risk")
+            st.metric("Prob. of loss", f"{stats['prob_loss']:.1%}")
+            st.metric("1st percentile (P01)", f"{stats['p01']:.2f}×")
+            st.metric("Mean terminal", f"{stats['mean']:.2f}×")
+
+        # Plot: a subset of paths so the chart stays responsive
+        import plotly.graph_objs as go
+        n_plot = min(200, eq_paths.shape[0])
+        plot_idx = np.linspace(0, eq_paths.shape[0] - 1, n_plot).astype(int)
+        eq_plot = eq_paths[plot_idx]
+
+        x = list(range(eq_plot.shape[1]))
+        fig_mc = go.Figure()
+
+        for i in range(eq_plot.shape[0]):
+            fig_mc.add_trace(go.Scatter(x=x, y=eq_plot[i], mode="lines", line=dict(width=1), name=None, showlegend=False))
+
+        # Median path
+        median_path = np.median(eq_paths, axis=0)
+        fig_mc.add_trace(go.Scatter(x=x, y=median_path, mode="lines", name="Median path", line=dict(width=3)))
+
+        fig_mc.update_layout(
+            height=520,
+            xaxis_title=f"Trading days (≈ {mc_years} year(s))",
+            yaxis_title="Equity (× initial capital)",
+        )
+        st.plotly_chart(fig_mc, use_container_width=True)
+
+        # Terminal distribution
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(x=terminal, nbinsx=60, name="Terminal equity"))
+        fig_hist.update_layout(height=360, xaxis_title="Terminal equity (× initial)", yaxis_title="Count")
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Monte Carlo failed: {e}")
+with st.expander("Strategy Overview", expanded=True):
+    st.markdown(
+        """
+**Signal model (LSTM):**  
+- The LSTM is used as a **forecasting model for next-period log returns** per asset.
+- In quant terms, it’s a **nonlinear time-series feature extractor** that maps a lookback window of returns → a one-step-ahead expected return estimate.
+
+**Portfolio construction:**  
+- Forecasts are converted to weights using a constrained softmax-style allocation.
+- Constraints enforce practical risk controls (min weight / max concentration).
+
+**Why Monte Carlo is added:**  
+- A backtest shows historical performance under your rule set.
+- Monte Carlo summarizes the **distribution of plausible future outcomes**, helping quantify tail risk and downside probabilities.
+        """
+    )
+
