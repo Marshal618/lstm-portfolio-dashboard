@@ -1,17 +1,35 @@
+import os
+import tempfile
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objs as go
+import streamlit.components.v1 as components
 import quantstats as qs
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
+
 from src.core import make_supervised, compute_weights_from_preds, predict_next_log_return
 from src.risk import (
     simulate_paths_parametric,
     simulate_paths_bootstrap,
     summarize_terminal,
+)
+
+# Supabase model packs (pretrained)
+# Create src/model_registry.py from the earlier snippet I gave you, and add to requirements.txt:
+# supabase, joblib, python-dotenv
+from src.model_registry import (
+    PackMeta,
+    make_pack_id,
+    list_packs,
+    download_pack,
+    upload_pack,
+    build_zip_from_models,
+    load_models_from_zip,
 )
 
 qs.extend_pandas()
@@ -112,15 +130,20 @@ def get_prices(tickers, start, end):
     return out
 
 
-
 # -----------------------------
 # CACHED MODEL TRAINING (big speed-up)
 # -----------------------------
 @st.cache_resource(show_spinner=False)
-def train_models_cached(log_returns_train: pd.DataFrame, symbols: tuple, lookback_period: int, epochs: int, fast_mode: bool):
+def train_models_cached(
+    log_returns_train: pd.DataFrame,
+    symbols: tuple,
+    lookback_period: int,
+    epochs: int,
+    fast_mode: bool,
+):
     """
-    Cache trained models so repeated runs don't retrain.
-    Using tuple(symbols) makes cache keys stable/hashiable.
+    Cache trained models so repeated runs don't retrain (within the same Streamlit runtime).
+    For cross-restart persistence + sharing, use Supabase model packs (below).
     """
     models, scalers = {}, {}
 
@@ -160,7 +183,6 @@ def train_models_cached(log_returns_train: pd.DataFrame, symbols: tuple, lookbac
     return models, scalers
 
 
-
 # -----------------------------
 # Header
 # -----------------------------
@@ -179,18 +201,25 @@ st.markdown(
   </span>
 </div>
 <p style="margin-top:6px; color:#64748b; font-size:15px;">
-ML-driven signal generation → constrained portfolio construction → systematic backtesting & risk diagnostics.
+Build a signal, turn it into a portfolio, then stress-test the risk.
 </p>
 """,
     unsafe_allow_html=True,
 )
 
-with st.expander("Strategy Overview", expanded=True):
-    st.write(
-        "This strategy trains an LSTM to forecast next-day log returns for selected equities. "
-        "Forecasted signals are converted into portfolio weights via a constrained softmax allocation "
-        "with minimum/maximum exposure limits. The portfolio rebalances monthly and is evaluated "
-        "with risk-adjusted metrics and benchmark comparison (SPY)."
+with st.expander("How this dashboard works", expanded=True):
+    st.markdown(
+        """
+**1) LSTM signal (forecast):** The LSTM looks at a recent window of returns for each stock and outputs a *next-step return guess*.
+It’s not “magic”; it’s just a flexible pattern detector.
+
+**2) Portfolio weights (rules):** We turn those forecasts into weights with simple constraints
+(minimum position size + max concentration).
+
+**3) Backtest (history):** We rebalance monthly and see how the strategy would have behaved.
+
+**4) Monte Carlo (what-if):** We simulate many possible future paths so you can see the range of outcomes, not just one curve.
+        """
     )
 
 # -----------------------------
@@ -198,8 +227,38 @@ with st.expander("Strategy Overview", expanded=True):
 # -----------------------------
 with st.sidebar:
     st.markdown("## Controls")
-    st.caption("Configure universe, training settings, and portfolio constraints.")
+    st.caption("Pick tickers, choose a model mode, then run the backtest.")
 
+    # ---- Supabase model packs
+    st.markdown("### Pretrained models (Supabase)")
+    model_mode = st.radio("Mode", ["Use pretrained (fast)", "Train & upload (slow)"], index=0)
+    force_retrain = st.toggle("Force retrain", value=False, help="Ignore pretrained packs/caches and retrain now.")
+
+    try:
+        available_packs = list_packs()
+    except Exception:
+        available_packs = []
+
+    selected_pack = None
+    if model_mode.startswith("Use"):
+        if available_packs:
+            selected_pack = st.selectbox("Model pack", available_packs, index=0)
+        else:
+            st.warning("No packs found (or Supabase secrets not set).")
+
+    st.divider()
+
+    # ---- Monte Carlo controls (in sidebar)
+    st.markdown("### Monte Carlo")
+    mc_enabled = st.toggle("Enable Monte Carlo", value=True)
+    mc_method = st.selectbox("Method", ["Bootstrap (recommended)", "Parametric (Normal)"])
+    mc_years = st.slider("Horizon (years)", 1, 5, 1)
+    mc_sims = st.slider("Simulations", 200, 10000, 2000, step=200)
+    mc_seed = st.number_input("Seed", min_value=0, max_value=10_000_000, value=42, step=1)
+
+    st.divider()
+
+    # ---- Universe
     st.markdown("### Universe")
     symbols_default = ["TSM", "GOOGL", "EQIX", "ASML", "ALGN", "KO", "DIS", "XOM", "AWK", "BHP", "V"]
     symbols = st.multiselect("Tickers", options=symbols_default, default=symbols_default)
@@ -208,18 +267,21 @@ with st.sidebar:
     end_date = st.date_input("End date", value=pd.to_datetime("2022-12-31"))
     trade_start = st.date_input("Trade start", value=pd.to_datetime("2017-01-01"))
 
-    st.markdown("### Model")
-    fast_mode = st.toggle("Fast mode (recommended)", value=True, help="Trains faster using a smaller model and shorter training window.")
-
+    st.markdown("### LSTM training")
+    fast_mode = st.toggle(
+        "Fast mode",
+        value=True,
+        help="Smaller network + shorter training window.",
+    )
     lookback_period = st.slider("Lookback (days)", 60, 300 if fast_mode else 400, 180 if fast_mode else 252, step=5)
-    epochs = st.slider("LSTM epochs", 1, 12 if fast_mode else 30, 4 if fast_mode else 10, step=1)
+    epochs = st.slider("Epochs", 1, 12 if fast_mode else 30, 4 if fast_mode else 10, step=1)
 
-    st.markdown("### Portfolio Constraints")
+    st.markdown("### Portfolio constraints")
     min_weight = st.slider("Min weight", 0.0, 0.10, 0.01, step=0.005)
     max_weight = st.slider("Max weight", 0.10, 1.00, 0.40, step=0.05)
 
     st.markdown("### Risk-free rate")
-    annual_rf = st.number_input("Risk-free rate (annual)", min_value=0.0, max_value=0.20, value=0.03, step=0.005)
+    annual_rf = st.number_input("Risk-free (annual)", min_value=0.0, max_value=0.20, value=0.03, step=0.005)
 
     st.markdown("### Training window")
     if fast_mode:
@@ -257,18 +319,52 @@ rebalance_dates = pd.to_datetime(rebalance_dates.values)
 # Training data: rolling recent window (speed + avoids overfitting to old regimes)
 log_returns_train = log_returns.tail(int(train_days)).copy()
 
-# Train models (CACHED)
-with st.spinner("Training LSTMs (cached)..."):
-    models, scalers = train_models_cached(
-        log_returns_train,
-        tuple(symbols),
-        lookback_period,
-        epochs,
-        fast_mode,
-    )
+# -----------------------------
+# Load pretrained OR train + upload
+# -----------------------------
+pack_id = make_pack_id(symbols, lookback_period, epochs, int(train_days), fast_mode)
+
+models, scalers = None, None
+
+if (not force_retrain) and model_mode.startswith("Use") and selected_pack:
+    try:
+        with st.spinner(f"Loading pretrained pack: {selected_pack}..."):
+            zip_bytes = download_pack(selected_pack)
+            meta, models, scalers = load_models_from_zip(zip_bytes)
+        st.success(f"Loaded pretrained pack: {selected_pack}")
+    except Exception as e:
+        st.warning(f"Could not load pretrained pack. Falling back to training. ({e})")
+        models, scalers = None, None
+
+if models is None or scalers is None:
+    with st.spinner("Training LSTMs (cached)..."):
+        models, scalers = train_models_cached(
+            log_returns_train,
+            tuple(symbols),
+            lookback_period,
+            epochs,
+            fast_mode,
+        )
+
+    if model_mode.startswith("Train"):
+        try:
+            with st.spinner(f"Uploading model pack to Supabase: {pack_id}..."):
+                meta = PackMeta(
+                    pack_id=pack_id,
+                    symbols=tuple(symbols),
+                    lookback=lookback_period,
+                    epochs=epochs,
+                    train_days=int(train_days),
+                    fast_mode=bool(fast_mode),
+                )
+                zip_bytes = build_zip_from_models(meta, models, scalers)
+                upload_pack(pack_id, zip_bytes)
+            st.success(f"Uploaded model pack: {pack_id}")
+        except Exception as e:
+            st.warning(f"Trained models, but upload failed: {e}")
 
 if len(models) < 2:
-    st.error("Not enough models trained (try fewer tickers, smaller lookback, or longer training window).")
+    st.error("Not enough models trained/loaded (try fewer tickers, smaller lookback, or longer training window).")
     st.stop()
 
 # Initialize portfolio
@@ -328,10 +424,20 @@ k3.metric("Sharpe", f"{sh:.2f}")
 k4.metric("Max Drawdown", f"{mdd:.2%}")
 
 # -----------------------------
+# QuantStats report as cached HTML (always-on)
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def quantstats_html(returns: pd.Series, benchmark: pd.Series, rf: float) -> str:
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "report.html")
+        qs.reports.html(returns, benchmark=benchmark, rf=rf, compounded=True, output=path)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+# -----------------------------
 # Charts + Report (Tabs)
 # -----------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["Performance", "Portfolio Weights", "Report", "Risk (Monte Carlo)"])
-
 
 with tab1:
     st.subheader("Equity Curve")
@@ -363,88 +469,65 @@ with tab2:
 
 with tab3:
     st.subheader("QuantStats Report")
-    st.caption("Full performance report (can be heavy to render).")
-
-    # Optional: let user choose to render full report (avoids slow UI by default)
-    render_report = st.toggle("Render full QuantStats report", value=False)
-    if render_report:
-        qs.reports.full(portfolio_returns, benchmark=spy_returns, rf=annual_rf, compounded=True)
-    else:
-        st.info("Toggle on to render the full report. (This can take a bit.)")
-
-st.caption("Tip: In **Fast mode**, repeated runs with the same settings reuse cached models and should be much faster.")
+    st.caption("Auto-generated report for deeper diagnostics (cached to keep the app responsive).")
+    html = quantstats_html(portfolio_returns, spy_returns, annual_rf)
+    components.html(html, height=900, scrolling=True)
 
 with tab4:
     st.subheader("Monte Carlo Risk Simulation")
-    st.caption("Simulate many plausible future equity paths using either parametric (Normal) returns or bootstrap resampling.")
+    st.caption("A quick stress test: what might the next year (or few years) look like if returns behave similarly to the past?")
+
+    if not mc_enabled:
+        st.info("Turn on Monte Carlo in the sidebar to run simulations.")
+        st.stop()
 
     st.markdown(
         """
-**What this is (quant explanation):**
-- **Backtest** answers: *“What happened historically under my rules?”*
-- **Monte Carlo** answers: *“Given the return characteristics I observed, what range of outcomes could happen?”*
-
-**How to interpret:**
-- The fan of lines = many possible future portfolio paths.
-- The terminal distribution tells you downside risk (loss probability, bad-percentile outcomes) and upside potential.
+**How to read this:**
+- The backtest is *one* path that happened in the past.
+- Monte Carlo generates *many* possible future paths so you can see a range: good outcomes, bad outcomes, and everything in between.
+- Focus on the **loss probability** and the **bad-percentile outcomes** (like the 5th percentile) if you care about downside.
         """
     )
 
-    mc_col1, mc_col2, mc_col3 = st.columns([1.2, 1.0, 1.0])
+    mc_days = int(252 * mc_years)
 
-    with mc_col1:
-        mc_method = st.selectbox("Simulation method", ["Bootstrap (recommended)", "Parametric (Normal)"])
-        mc_years = st.slider("Horizon (years)", 1, 5, 1)
-        mc_days = int(252 * mc_years)
-        mc_sims = st.slider("Number of simulations", 200, 10000, 2000, step=200)
-        mc_seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=42, step=1)
-
-    # Use your already-computed daily portfolio returns
-    # portfolio_returns exists earlier in your script
     if portfolio_returns.empty:
         st.warning("No returns available for Monte Carlo.")
         st.stop()
 
     try:
         if mc_method.startswith("Bootstrap"):
-            eq_paths, meta = simulate_paths_bootstrap(portfolio_returns, n_sims=mc_sims, n_days=mc_days, seed=int(mc_seed))
-            method_note = "Bootstrap resamples realized daily returns (keeps fat tails better)."
+            eq_paths, _ = simulate_paths_bootstrap(
+                portfolio_returns, n_sims=int(mc_sims), n_days=int(mc_days), seed=int(mc_seed)
+            )
+            method_note = "Bootstrap reuses real daily returns (usually better for capturing big swings)."
         else:
-            eq_paths, meta = simulate_paths_parametric(portfolio_returns, n_sims=mc_sims, n_days=mc_days, seed=int(mc_seed))
-            method_note = "Parametric assumes i.i.d. Normal returns (often underestimates tail risk)."
+            eq_paths, _ = simulate_paths_parametric(
+                portfolio_returns, n_sims=int(mc_sims), n_days=int(mc_days), seed=int(mc_seed)
+            )
+            method_note = "Parametric uses a Normal approximation (fast, but can understate extreme moves)."
 
         stats, terminal = summarize_terminal(eq_paths)
 
-        with mc_col2:
-            st.markdown("### Terminal outcomes (× initial capital)")
-            st.write(f"Method: {mc_method}")
-            st.caption(method_note)
-            st.metric("Median (P50)", f"{stats['p50']:.2f}×")
-            st.metric("5th percentile (P05)", f"{stats['p05']:.2f}×")
-            st.metric("95th percentile (P95)", f"{stats['p95']:.2f}×")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Median outcome", f"{stats['p50']:.2f}×")
+        c2.metric("5th percentile", f"{stats['p05']:.2f}×")
+        c3.metric("Prob. of loss", f"{stats['prob_loss']:.1%}")
+        st.caption(method_note)
 
-        with mc_col3:
-            st.markdown("### Downside risk")
-            st.metric("Prob. of loss", f"{stats['prob_loss']:.1%}")
-            st.metric("1st percentile (P01)", f"{stats['p01']:.2f}×")
-            st.metric("Mean terminal", f"{stats['mean']:.2f}×")
-
-        # Plot: a subset of paths so the chart stays responsive
-        import plotly.graph_objs as go
+        # Plot: subset of paths for responsiveness
         n_plot = min(200, eq_paths.shape[0])
         plot_idx = np.linspace(0, eq_paths.shape[0] - 1, n_plot).astype(int)
         eq_plot = eq_paths[plot_idx]
 
         x = list(range(eq_plot.shape[1]))
         fig_mc = go.Figure()
-
         for i in range(eq_plot.shape[0]):
-            fig_mc.add_trace(go.Scatter(x=x, y=eq_plot[i], mode="lines", line=dict(width=1), name=None, showlegend=False))
+            fig_mc.add_trace(go.Scatter(x=x, y=eq_plot[i], mode="lines", showlegend=False, line=dict(width=1)))
 
-        # Median path
         median_path = np.median(eq_paths, axis=0)
-        fig_mc.add_trace(go.Scatter(x=x, y=median_path, mode="lines", name="Median path", line=dict(width=3)))
-
+        fig_mc.add_trace(go.Scatter(x=x, y=median_path, mode="lines", name="Median", line=dict(width=3)))
         fig_mc.update_layout(
             height=520,
             xaxis_title=f"Trading days (≈ {mc_years} year(s))",
@@ -452,7 +535,6 @@ with tab4:
         )
         st.plotly_chart(fig_mc, use_container_width=True)
 
-        # Terminal distribution
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Histogram(x=terminal, nbinsx=60, name="Terminal equity"))
         fig_hist.update_layout(height=360, xaxis_title="Terminal equity (× initial)", yaxis_title="Count")
@@ -460,20 +542,10 @@ with tab4:
 
     except Exception as e:
         st.error(f"Monte Carlo failed: {e}")
-with st.expander("Strategy Overview", expanded=True):
-    st.markdown(
-        """
-**Signal model (LSTM):**  
-- The LSTM is used as a **forecasting model for next-period log returns** per asset.
-- In quant terms, it’s a **nonlinear time-series feature extractor** that maps a lookback window of returns → a one-step-ahead expected return estimate.
 
-**Portfolio construction:**  
-- Forecasts are converted to weights using a constrained softmax-style allocation.
-- Constraints enforce practical risk controls (min weight / max concentration).
+st.caption(
+    "Tip: If you select **Use pretrained**, the app loads saved models instantly. "
+    "Use **Train & upload** only when you want to create a new model pack."
+)
 
-**Why Monte Carlo is added:**  
-- A backtest shows historical performance under your rule set.
-- Monte Carlo summarizes the **distribution of plausible future outcomes**, helping quantify tail risk and downside probabilities.
-        """
-    )
 
