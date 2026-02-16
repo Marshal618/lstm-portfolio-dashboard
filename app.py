@@ -302,6 +302,27 @@ if not run:
 if len(symbols) < 2:
     st.error("Pick at least 2 tickers.")
     st.stop()
+if walk_forward:
+    equity = run_walk_forward(
+        returns=log_returns,
+        signal_type=signal_type,
+        weight_method=weight_method,
+        symbols=symbols,
+        train_years=3,
+        test_months=6,
+    )
+else:
+    equity = simulate_portfolio(
+        returns=log_returns,
+        signal_type=signal_type,
+        weight_method=weight_method,
+        symbols=symbols,
+        models=models,
+        scalers=scalers,
+        lookback=lookback_period,
+        rebalance="M",
+        transaction_cost_bps=transaction_cost,
+    )
 
 # -----------------------------
 # Backtest Data
