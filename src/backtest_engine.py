@@ -1,18 +1,17 @@
 import numpy as np
 import pandas as pd
 
-def compute_signal(
-  signal_type: str,
-  date,
-  symbols,
-  log_returns,
-  models=None,
-  lookback=60
-):
-    """
-    Returns pd.Series of signal values indexed by symbol.
-    """
 
+def compute_signal(
+    signal_type: str,
+    date,
+    symbols,
+    log_returns,
+    models=None,
+    scalers=None,   # FIX: was missing from signature; used inside LSTM branch
+    lookback=60,
+):
+    """Returns pd.Series of signal values indexed by symbol."""
     signals = {}
 
     for sym in symbols:
@@ -23,6 +22,9 @@ def compute_signal(
             continue
 
         if signal_type == "LSTM":
+            if models is None or scalers is None or sym not in models:
+                signals[sym] = np.nan
+                continue
             last_window = hist.values[-lookback:].reshape(-1, 1)
             scaled = scalers[sym].transform(last_window).flatten()
             X = scaled.reshape((1, lookback, 1))
@@ -46,49 +48,6 @@ def compute_signal(
 
     return pd.Series(signals)
 
-def simulate_portfolio(
-    returns,
-    signal_type,
-    weight_method,
-    symbols,
-    models=None,
-    scalers=None,
-    lookback=60,
-    rebalance="M",
-    transaction_cost_bps=5,
-):
-    equity = []
-    weights_prev = None
-
-    for date in returns.index:
-
-        if weights_prev is None or date.to_period(rebalance) != prev_date.to_period(rebalance):
-            signal = compute_signal(
-                signal_type,
-                date,
-                symbols,
-                returns,
-                models,
-                scalers,
-                lookback,
-            )
-
-            weights = compute_weights(signal, method=weight_method)
-
-            if weights_prev is not None:
-                turnover = np.abs(weights - weights_prev).sum()
-                cost = turnover * transaction_cost_bps / 10000
-            else:
-                cost = 0
-
-            weights_prev = weights
-
-        daily_ret = (returns.loc[date] * weights_prev).sum() - cost
-        equity.append(daily_ret)
-
-        prev_date = date
-
-    return pd.Series(equity, index=returns.index).cumsum().apply(np.exp)
 
 def compute_weights(
     signal: pd.Series,
@@ -97,7 +56,6 @@ def compute_weights(
     max_weight=0.40,
 ):
     signal = signal.dropna()
-
     if signal.empty:
         return pd.Series(dtype=float)
 
@@ -122,14 +80,13 @@ def compute_weights(
         w = expx / expx.sum()
 
     weights = pd.Series(w, index=signal.index)
-
     weights = weights + min_weight
     weights = weights / weights.sum()
-
     weights = weights.clip(upper=max_weight)
-
     return weights / weights.sum()
 
+
+# FIX: removed the duplicate simulate_portfolio definition that appeared twice in the file
 def simulate_portfolio(
     returns,
     signal_type,
@@ -143,36 +100,35 @@ def simulate_portfolio(
 ):
     equity = []
     weights_prev = None
+    prev_date = None
 
     for date in returns.index:
-
         if weights_prev is None or date.to_period(rebalance) != prev_date.to_period(rebalance):
             signal = compute_signal(
-                signal_type,
-                date,
-                symbols,
-                returns,
-                models,
-                scalers,
-                lookback,
+                signal_type, date, symbols, returns, models, scalers, lookback
             )
-
             weights = compute_weights(signal, method=weight_method)
 
-            if weights_prev is not None:
-                turnover = np.abs(weights - weights_prev).sum()
+            if weights_prev is not None and not weights.empty:
+                turnover = np.abs(weights - weights_prev.reindex(weights.index).fillna(0)).sum()
                 cost = turnover * transaction_cost_bps / 10000
             else:
-                cost = 0
+                cost = 0.0
 
-            weights_prev = weights
+            if not weights.empty:
+                weights_prev = weights
 
-        daily_ret = (returns.loc[date] * weights_prev).sum() - cost
+        if weights_prev is None:
+            equity.append(0.0)
+            prev_date = date
+            continue
+
+        daily_ret = (returns.loc[date, symbols] * weights_prev.reindex(symbols).fillna(0)).sum() - cost
         equity.append(daily_ret)
-
         prev_date = date
 
     return pd.Series(equity, index=returns.index).cumsum().apply(np.exp)
+
 
 def run_walk_forward(
     returns,
@@ -183,7 +139,6 @@ def run_walk_forward(
     test_months=6,
 ):
     results = []
-
     dates = returns.index
     start = dates.min()
 
@@ -191,23 +146,14 @@ def run_walk_forward(
         train_end = start + pd.DateOffset(years=train_years)
         test_end = train_end + pd.DateOffset(months=test_months)
 
-        train = returns.loc[start:train_end]
         test = returns.loc[train_end:test_end]
-
         if len(test) == 0:
             break
 
-        eq = simulate_portfolio(
-            test,
-            signal_type,
-            weight_method,
-            symbols,
-        )
-
+        eq = simulate_portfolio(test, signal_type, weight_method, symbols)
         results.append(eq)
-
         start = train_end
 
+    if not results:
+        return pd.Series(dtype=float)
     return pd.concat(results)
-
-
